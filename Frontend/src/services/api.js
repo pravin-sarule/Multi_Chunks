@@ -706,7 +706,7 @@
 
 
 // src/services/api.js
-const API_BASE_URL = "http://localhost:8000"; // ✅ Force localhost backend
+const API_BASE_URL = "https://multi-chunks-backend-110685455967.asia-south1.run.app"; // ✅ Force localhost backend
 
 class ApiService {
   constructor() {
