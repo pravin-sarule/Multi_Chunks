@@ -116,6 +116,9 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Batch Upload & processing for large documents
 router.post('/batch-upload', protect, upload.single('document'), controller.batchUploadDocument);
+router.post('/batch-upload/complete', protect, controller.completeDirectBatchUpload);
+router.post('/direct-upload-url', protect, controller.generateDirectUploadUrl);
+router.post('/generate-upload-url', protect, controller.generateDirectUploadUrl); // Alias for consistency
 
 // Post-processing analytics
 router.post('/analyze', protect, controller.analyzeDocument);

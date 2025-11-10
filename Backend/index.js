@@ -186,7 +186,7 @@ app.use(morgan('dev'));
 // --------------------
 const allowedOrigins = [
   'http://localhost:5173',
-  'https://nexsummarizer.netlify.app'
+  'https://multi-chunks.netlify.app'
 ];
 
 app.use(cors({
