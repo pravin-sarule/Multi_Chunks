@@ -1654,83 +1654,461 @@ const AnalysisPage = () => {
     setShowUploadModal(true);
   };
 
+  /**
+   * Determines whether to use direct backend upload (for localhost) or GCS signed URL upload (for production/Cloud Run).
+   * 
+   * IMPORTANT: Cloud Run has a 32 MB request body limit. For files > 32 MB, we MUST use direct GCS upload
+   * via signed URLs, which bypasses Cloud Run entirely for the file upload itself.
+   * 
+   * @returns {boolean} true if using localhost (direct backend upload), false for production (GCS direct upload)
+   */
+  const useDirectBackendUpload = () => {
+    if (!API_BASE_URL) return false;
+    const normalized = API_BASE_URL.toLowerCase();
+    // Only use direct backend upload for localhost/127.0.0.1
+    // For Cloud Run or any production URL, use GCS direct upload to bypass 32 MB limit
+    return normalized.includes("localhost") || normalized.includes("127.0.0.1");
+  };
+
+  const uploadViaBackend = (token, chunkSizeValue, chunkOverlapValue) => {
+    return new Promise((resolve, reject) => {
+      console.log("📤 Preparing direct backend upload...");
+      const formData = new FormData();
+      formData.append("document", selectedFile);
+      formData.append("chunkingMethod", selectedChunkMethod);
+      formData.append("chunkSize", String(chunkSizeValue));
+      formData.append("chunkOverlap", String(chunkOverlapValue));
+
+      const xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percentage = Math.round((event.loaded / event.total) * 100);
+          setUploadProgress(percentage);
+          setProcessingStatus({ status: "uploading", progress: percentage });
+          if (percentage % 25 === 0) {
+            console.log(`📤 Upload progress: ${percentage}%`);
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        console.log(`📥 Direct upload response:`, {
+          status: xhr.status,
+          statusText: xhr.statusText,
+        });
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            console.log("✅ Direct upload response data:", data);
+            const id = data.file_id || data.document_id || data.id;
+            if (!id) {
+              console.error("❌ No file ID in response:", data);
+              reject(new Error("Upload succeeded but no file_id returned."));
+              return;
+            }
+            console.log(`✅ Upload complete! File ID: ${id}, Starting status polling...`);
+            setFileId(id);
+            setSuccess("File uploaded successfully! Processing started.");
+            setProcessingStatus({ status: "batch_processing", progress: 0 });
+            pollProcessingStatus(id);
+            resolve();
+          } catch (parseError) {
+            console.error("❌ Failed to parse upload response:", parseError);
+            reject(new Error("Failed to parse upload response."));
+          }
+        } else {
+          let errorMsg = `Upload failed with status ${xhr.status}`;
+          try {
+            const responseText = xhr.responseText;
+            if (responseText) {
+              const errorData = JSON.parse(responseText);
+              errorMsg = errorData.error || errorMsg;
+              console.error("❌ Upload error response:", errorData);
+            }
+          } catch (e) {
+            console.error("❌ Upload failed:", xhr.status, xhr.statusText);
+          }
+          reject(new Error(errorMsg));
+        }
+      };
+
+      xhr.onerror = () => {
+        console.error("❌ Network error during direct upload");
+        reject(new Error("Upload failed due to network error."));
+      };
+
+      xhr.ontimeout = () => {
+        console.error("❌ Direct upload timeout");
+        reject(new Error("Upload timed out. Please try again."));
+      };
+
+      xhr.timeout = 600000; // 10 minutes timeout
+
+      console.log(`📤 Starting direct backend upload to ${API_BASE_URL}/api/doc/batch-upload`);
+      xhr.open("POST", `${API_BASE_URL}/api/doc/batch-upload`);
+      if (token) {
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      }
+      xhr.send(formData);
+    });
+  };
+
+  // const uploadFileToSignedUrl = (signedUrl, requiredHeaders = {}, fileBlob) => {
+  //   return new Promise((resolve, reject) => {
+  //     const xhr = new XMLHttpRequest();
+  //     xhr.open("PUT", signedUrl);
+
+  //     Object.entries(requiredHeaders).forEach(([key, value]) => {
+  //       if (key && value) {
+  //         xhr.setRequestHeader(key, value);
+  //       }
+  //     });
+
+  //     xhr.upload.onprogress = (event) => {
+  //       if (event.lengthComputable) {
+  //         const percentage = Math.round((event.loaded / event.total) * 100);
+  //         setUploadProgress(percentage);
+  //       }
+  //     };
+
+  //     xhr.onload = () => {
+  //       if (xhr.status >= 200 && xhr.status < 300) {
+  //         setUploadProgress(100);
+  //         resolve();
+  //       } else {
+  //         reject(new Error(`Cloud upload failed with status ${xhr.status}`));
+  //       }
+  //     };
+
+  //     xhr.onerror = () => reject(new Error("Network error during cloud upload."));
+  //     xhr.send(fileBlob);
+  //   });
+  // };
+
+  const uploadFileToSignedUrl = (signedUrl, requiredHeaders = {}, fileBlob, expiresInSeconds = 900) => {
+    return new Promise((resolve, reject) => {
+      console.log(`📤 Initializing GCS upload...`, {
+        fileSize: `${(fileBlob.size / (1024 * 1024)).toFixed(2)} MB`,
+        contentType: requiredHeaders["Content-Type"],
+      });
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", signedUrl);
+
+      // Set required headers from backend
+      Object.entries(requiredHeaders).forEach(([key, value]) => {
+        if (key && value) {
+          try {
+            xhr.setRequestHeader(key, value);
+            console.log(`📋 Set header: ${key} = ${value}`);
+          } catch (err) {
+            console.warn(`⚠️ Failed to set header ${key}:`, err);
+          }
+        }
+      });
+
+      // Track upload progress for large files
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percentage = Math.round((event.loaded / event.total) * 100);
+          setUploadProgress(percentage);
+          setProcessingStatus({ status: "uploading", progress: percentage });
+          
+          // Log progress for large files (> 10MB) or every 25% for smaller files
+          if (fileBlob.size > 10 * 1024 * 1024 && percentage % 10 === 0) {
+            const uploadedMB = (event.loaded / (1024 * 1024)).toFixed(2);
+            const totalMB = (event.total / (1024 * 1024)).toFixed(2);
+            console.log(`📤 Upload progress: ${uploadedMB}MB / ${totalMB}MB (${percentage}%)`);
+          } else if (percentage % 25 === 0) {
+            console.log(`📤 Upload progress: ${percentage}%`);
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        console.log(`📥 Upload response received:`, {
+          status: xhr.status,
+          statusText: xhr.statusText,
+        });
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setUploadProgress(100);
+          setProcessingStatus({ status: "uploaded", progress: 100 });
+          console.log("✅ File uploaded successfully to GCS");
+          resolve();
+        } else {
+          let errorMsg = `Cloud upload failed with status ${xhr.status}`;
+          try {
+            const responseText = xhr.responseText;
+            if (responseText) {
+              errorMsg += `: ${responseText}`;
+              console.error("❌ Upload error response:", responseText);
+            }
+          } catch (e) {
+            // Ignore if response text is not available
+          }
+          console.error("❌ Upload failed:", errorMsg);
+          reject(new Error(errorMsg));
+        }
+      };
+
+      xhr.onerror = () => {
+        console.error("❌ Network error during upload");
+        reject(new Error("Network error during cloud upload. Please check your connection and try again."));
+      };
+      
+      xhr.ontimeout = () => {
+        console.error("❌ Upload timeout");
+        reject(new Error(`Upload timed out. The signed URL expires in ${expiresInSeconds} seconds. Please try again.`));
+      };
+      
+      // Calculate timeout based on expiration time, but cap at 2 hours for very large files
+      // Use 80% of expiration time or 2 hours, whichever is smaller
+      const maxTimeout = Math.min(expiresInSeconds * 1000 * 0.8, 2 * 60 * 60 * 1000);
+      xhr.timeout = maxTimeout;
+      
+      console.log(`📤 Starting upload to GCS (timeout: ${Math.round(maxTimeout / 1000)}s)`);
+      xhr.send(fileBlob);
+    });
+  };
+  
   const handleUploadWithChunkMethod = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile) {
+      console.error("❌ No file selected");
+      setError("Please select a file to upload.");
+      return;
+    }
+
+    console.log("🚀 Starting upload process...", {
+      fileName: selectedFile.name,
+      fileSize: `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`,
+      contentType: selectedFile.type,
+    });
+
+    const token = getAuthToken();
+    if (!token) {
+      console.error("❌ No authentication token found");
+      setError("Authentication required. Please log in again.");
+      return;
+    }
 
     setIsUploading(true);
     setError(null);
+    setSuccess(null);
     setFile(selectedFile);
     setUploadProgress(0);
+    setProcessingStatus({ status: "uploading", progress: 0 });
     setShowUploadModal(false);
 
-    const formData = new FormData();
-    formData.append("document", selectedFile);
-    formData.append("chunkingMethod", selectedChunkMethod);
-    formData.append("chunkSize", chunkSize);
-    formData.append("chunkOverlap", chunkOverlap);
+    const contentType = selectedFile.type || "application/octet-stream";
+    const chunkSizeValue = Number(chunkSize) || 4000;
+    const chunkOverlapValue = Number(chunkOverlap) || 400;
 
-    const xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        setUploadProgress(Math.round((e.loaded / e.total) * 100));
-      }
-    };
+    // File size limit for direct backend uploads (32 MB)
+    // For larger files, always use GCS signed URL upload regardless of environment
+    const FILE_SIZE_LIMIT_MB = 32;
+    const FILE_SIZE_LIMIT_BYTES = FILE_SIZE_LIMIT_MB * 1024 * 1024;
+    const isLocalhost = useDirectBackendUpload();
+    const isLargeFile = selectedFile.size > FILE_SIZE_LIMIT_BYTES;
+    
+    // Use GCS signed URL upload for:
+    // 1. Production environments (not localhost)
+    // 2. Large files (> 32 MB) even on localhost
+    const useGcsUpload = !isLocalhost || isLargeFile;
+    
+    console.log(`🔍 Upload mode: ${useGcsUpload ? "GCS Signed URL" : "Direct Backend (localhost)"}`, {
+      isLocalhost,
+      isLargeFile,
+      fileSizeMB: `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`,
+    });
 
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const data = JSON.parse(xhr.responseText);
-        const id = data.file_id || data.document_id || data.id;
-
-        if (!id) {
-          setError("Upload succeeded but no file_id returned");
-          setIsUploading(false);
-          return;
+    // Only use direct backend upload for small files on localhost
+    if (!useGcsUpload) {
+      console.log("📤 Using direct backend upload (localhost mode, small file)");
+      try {
+        await uploadViaBackend(token, chunkSizeValue, chunkOverlapValue);
+        setSelectedFile(null);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
         }
-        setFileId(id);
-        setSuccess("File uploaded successfully!");
-        setIsUploading(false);
-        pollProcessingStatus(id);
-      } else {
-        setError(`Upload failed: ${xhr.status}`);
+        console.log("✅ Direct upload completed successfully");
+      } catch (err) {
+        console.error("❌ Direct upload error:", err);
+        setError(err.message || "Upload failed. Please try again.");
         setIsUploading(false);
       }
-    };
+      return;
+    }
 
-    xhr.onerror = () => {
-      setError("Upload failed due to network error.");
+    // For large files or production, use GCS signed URL upload
+    if (isLargeFile && isLocalhost) {
+      console.log("📤 Large file detected - using GCS signed URL upload even on localhost");
+    }
+
+    try {
+      console.log("📤 Step 1: Requesting signed upload URL from backend...");
+      // Step 1: Request signed upload URL from backend
+      const uploadUrlResponse = await fetch(`${API_BASE_URL}/api/doc/generate-upload-url`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fileName: selectedFile.name,
+          contentType,
+          fileSize: selectedFile.size, // Send file size for expiration calculation
+          folder: "batch-uploads",
+          isBatch: true,
+        }),
+      });
+
+      if (!uploadUrlResponse.ok) {
+        const errorData = await uploadUrlResponse.json().catch(() => ({}));
+        const errorMsg = errorData.error || `Failed to generate secure upload URL (${uploadUrlResponse.status})`;
+        console.error("❌ Failed to generate upload URL:", errorData);
+        throw new Error(errorMsg);
+      }
+
+      const uploadUrlData = await uploadUrlResponse.json();
+      console.log("✅ Step 1 complete: Received signed URL", {
+        expiresInSeconds: uploadUrlData.expiresInSeconds,
+        bucket: uploadUrlData.bucket,
+      });
+
+      const { signedUrl, requiredHeaders, gcsPath, gsUri, expiresInSeconds } = uploadUrlData || {};
+
+      if (!signedUrl || (!gcsPath && !gsUri)) {
+        console.error("❌ Invalid upload URL response:", uploadUrlData);
+        throw new Error("Upload URL response missing required data.");
+      }
+
+      console.log(`📤 Step 2: Uploading file to GCS (URL valid for ${expiresInSeconds || 900} seconds)...`);
+      setProcessingStatus({ status: "uploading", progress: 0 });
+
+      // Step 2: Upload file directly to cloud storage with progress tracking
+      await uploadFileToSignedUrl(signedUrl, requiredHeaders, selectedFile, expiresInSeconds);
+
+      console.log("✅ Step 2 complete: File uploaded to GCS successfully");
+      setProcessingStatus({ status: "uploaded", progress: 100 });
+
+      console.log("📤 Step 3: Notifying backend to begin processing...");
+      // Step 3: Notify backend to begin processing
+      const finalizeResponse = await fetch(`${API_BASE_URL}/api/doc/batch-upload/complete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          gcsPath,
+          gsUri,
+          fileName: selectedFile.name,
+          contentType,
+          size: selectedFile.size,
+          chunkingMethod: selectedChunkMethod,
+          chunkSize: chunkSizeValue,
+          chunkOverlap: chunkOverlapValue,
+        }),
+      });
+
+      if (!finalizeResponse.ok) {
+        const errorData = await finalizeResponse.json().catch(() => ({}));
+        console.error("❌ Failed to finalize upload:", errorData);
+        throw new Error(errorData.error || `Failed to finalize upload and start processing (${finalizeResponse.status})`);
+      }
+
+      const finalizeData = await finalizeResponse.json();
+      console.log("✅ Step 3 complete: Processing initiated", finalizeData);
+
+      const id = finalizeData.file_id || finalizeData.document_id || finalizeData.id;
+
+      if (!id) {
+        console.error("❌ No file ID in response:", finalizeData);
+        throw new Error("Processing initiated but no file identifier returned.");
+      }
+
+      console.log(`✅ Upload complete! File ID: ${id}, Starting status polling...`);
+      setFileId(id);
+      setSuccess("File uploaded successfully! Processing started.");
+      setProcessingStatus({ status: "batch_processing", progress: 0 });
+      pollProcessingStatus(id);
+      setSelectedFile(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } catch (err) {
+      console.error("❌ Upload error:", err);
+      console.error("Error details:", {
+        message: err.message,
+        stack: err.stack,
+      });
+      setError(err.message || "Upload failed. Please try again.");
+      setProcessingStatus({ status: "error", error: err.message });
       setIsUploading(false);
-    };
-
-    const token = getAuthToken();
-    xhr.open("POST", `${API_BASE_URL}/api/doc/batch-upload`);
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    xhr.send(formData);
+    }
   };
 
   const pollProcessingStatus = (id) => {
-    setProcessingStatus({ status: "batch_processing" });
+    console.log(`🔄 Starting status polling for file ID: ${id}`);
+    setProcessingStatus({ status: "batch_processing", progress: 0 });
     let tries = 0;
+    const maxTries = 300; // 10 minutes max (300 * 2 seconds)
+    
     const interval = setInterval(async () => {
       tries++;
       try {
         const token = getAuthToken();
+        if (!token) {
+          console.error("❌ No token available for status check");
+          clearInterval(interval);
+          setError("Authentication expired. Please refresh the page.");
+          return;
+        }
+
+        console.log(`🔄 Polling status (attempt ${tries}/${maxTries})...`);
         const res = await fetch(`${API_BASE_URL}/api/doc/status/${id}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
+
+        if (!res.ok) {
+          console.error(`❌ Status check failed: ${res.status}`);
+          if (tries > 5) {
+            clearInterval(interval);
+            setError(`Failed to check processing status (${res.status})`);
+          }
+          return;
+        }
+
         const data = await res.json();
+        console.log(`📊 Status update:`, data);
 
         setProcessingStatus(data);
+        
         if (data.status === "processed") {
+          console.log("✅ Document processed successfully!");
           clearInterval(interval);
           setSuccess("Document processed successfully!");
-        }
-        if (data.status === "error" || tries > 100) {
+          setIsUploading(false);
+        } else if (data.status === "error") {
+          console.error("❌ Processing error:", data);
           clearInterval(interval);
-          setError("Processing failed or timed out.");
+          setError(data.error || "Processing failed.");
+          setIsUploading(false);
+        } else if (tries >= maxTries) {
+          console.error("❌ Status polling timed out");
+          clearInterval(interval);
+          setError("Processing is taking longer than expected. Please refresh the page to check status.");
+          setIsUploading(false);
         }
       } catch (err) {
-        clearInterval(interval);
-        setError("Error while checking status.");
+        console.error("❌ Error while checking status:", err);
+        if (tries > 5) {
+          clearInterval(interval);
+          setError(`Error while checking status: ${err.message}`);
+          setIsUploading(false);
+        }
       }
     }, 2000);
   };
